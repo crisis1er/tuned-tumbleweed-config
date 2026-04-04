@@ -393,7 +393,7 @@ The custom profile solves all the above problems while keeping the correct base 
 
 ```ini
 [main]
-summary=Profil desktop optimisé streaming/KVM/réseau — AC uniquement
+summary=Optimized desktop profile for streaming, KVM and network stack — AC only
 include=balanced        # inherit all balanced defaults
 ```
 
