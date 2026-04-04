@@ -22,8 +22,9 @@ Deployed and validated in production. Every setting is justified.
 5. [Problems encountered with standard profiles](#5-problems-encountered-with-standard-profiles)
 6. [Why create a custom profile](#6-why-create-a-custom-profile)
 7. [Profile explained](#7-profile-explained)
-8. [Installation](#8-installation)
-9. [Useful commands](#9-useful-commands)
+8. [Repository structure](#8-repository-structure)
+9. [Installation](#9-installation)
+10. [Useful commands](#10-useful-commands)
 
 ---
 
@@ -338,7 +339,7 @@ Problem 2 — Audio crackles at stream start
             mode after inactivity. Waking it adds latency exactly
             at the moment playback starts.
 
-  Fix     : timeout=0 in [audio] — audio never auto-suspends
+  Fix     : [audio] timeout=-1 + modprobe.d power_save=0 + script.sh reinforcement
 ```
 
 ### `desktop` profile — why not just use it?
@@ -377,12 +378,19 @@ Profile inheritance chain:
        │
        ├── [sysctl] vm.swappiness=30 (reinforces 99-custom.conf)
        │
-       ├── [disk]  readahead=>4096 (USB SSD optimization)
+       ├── [disk]       readahead=>4096 (all devices)
        │
-       ├── [audio] timeout=0 (no suspend — prevents playback crackles)
+       ├── [scsi_host]  devices=host0,host1 — ALPM for SATA only
+       │                host2=USB (Samsung T7) excluded — no sysfs file
        │
-       └── [video] panel_power_savings=0 (no screen dimming on AC)
-                   radeon_powersave=dpm-performance (smooth decode)
+       ├── [audio]      timeout=-1 / reset_controller=false
+       │                workaround for tuned _norm_value() bug with timeout=0
+       │                actual setting handled by modprobe.d + script.sh
+       │
+       ├── [script]     script.sh — reinforces power_save=0 after plugins run
+       │
+       └── [video]      panel_power_savings=0 (no screen dimming on AC)
+                        radeon_powersave=dpm-performance (smooth decode)
 ```
 
 The custom profile solves all the above problems while keeping the correct base (`balanced` with `schedutil`) — no need to rewrite from scratch.
@@ -436,13 +444,77 @@ With readahead 4096:
                    next requests served from cache ──► lower latency
 ```
 
-### `[audio]` — no auto-suspend
+### `[scsi_host]` — ALPM for SATA hosts only
 
 ```ini
-timeout=0
+devices=host0,host1
+alpm=med_power_with_dipm
 ```
 
-Disables audio hardware power saving. The HDA audio controller stays active, eliminating the wake-up latency that causes the ~500ms crackle at the start of any media stream.
+ALPM (Active Link Power Management) is a SATA power-saving feature managed by the `[scsi_host]` plugin — **not** the `[disk]` plugin as one might expect.
+
+The `balanced` profile applies `alpm=med_power_with_dipm` to **all** SCSI hosts. On this system:
+
+| Host | Device | Transport | ALPM sysfs |
+|------|--------|-----------|------------|
+| host0 | sda (SATA HDD) | SATA | present ✓ |
+| host1 | sr0 (optical) | SATA | present ✓ |
+| host2 | sdb (Samsung T7) | **USB** | absent ✗ |
+
+`host2` is the boot USB SSD — USB devices have no `link_power_management_policy` file. Without `devices=host0,host1`, tuned attempts to write ALPM to host2, fails silently, then fails verification. Explicitly listing only SATA hosts solves both the runtime error and the verify failure.
+
+### `[audio]` — disable auto-suspend
+
+```ini
+timeout=-1
+reset_controller=false
+```
+
+The goal is to disable HDA Intel audio auto-suspend to prevent the ~500ms crackle at media playback start (Kodi, QMPlay2, Spotify). The actual setting is `power_save=0` in `/sys/module/snd_hda_intel/parameters/power_save`.
+
+**Why not `timeout=0`?**
+
+Setting `timeout=0` triggers a verified bug in tuned's `_norm_value()` function:
+
+```python
+# tuned/plugins/base.py — _norm_value()
+def _norm_value(self, value):
+    v = self._cmd.unquote(str(value))
+    if re.match(r'\s*(0+,?)+([\da-fA-F]*,?)*\s*$', v):
+        return re.sub(r'^\s*(0+,?)+', "", v)   # strips leading zeros
+    return v
+
+# _norm_value(0)      → str(0)='0'   → regex matches → strip '0' → ''
+# _norm_value('0\n')  → '0\n' matches (trailing \n = \s*$) → strip '0' → '\n'
+#
+# verify: expected='' vs actual='\n' → False → FAIL
+# log displays both as '' (str('\n').strip() = '') → misleading output
+```
+
+The kernel always appends `\n` to sysfs parameter files. After normalization, expected (`''`) and actual (`'\n'`) are not equal — verification fails even though the setting is correctly applied.
+
+**Workaround:**
+
+| Setting | Value | Effect |
+|---------|-------|--------|
+| `timeout=-1` | negative | `_set_timeout()` skips sysfs write (guard: `if timeout >= 0`), returns `None` → verify skips timeout check entirely |
+| `reset_controller=false` | `'0'` written | both expected and actual normalize to `''` via `_norm_value` → verify passes |
+
+The actual `power_save=0` is ensured by two layers:
+
+1. **`/etc/modprobe.d/99-audio-nosuspend.conf`** — applied at kernel module load time
+2. **`script.sh`** — writes `power_save=0` to sysfs after all plugins have run
+
+### `[script]` — post-plugin reinforcement
+
+```bash
+script=${i:PROFILE_DIR}/script.sh
+```
+
+Runs `script.sh` after all plugins have applied their settings. Handles two tasks:
+
+- **Audio**: writes `power_save=0` and `power_save_controller=N` directly to sysfs — reinforces what `modprobe.d` set at boot, overrides anything the balanced audio plugin may have written
+- **ALPM verify**: custom `verify()` function that only checks hosts with the ALPM sysfs file — avoids false failures on USB hosts
 
 ### `[video]` — GPU performance
 
@@ -458,7 +530,22 @@ radeon_powersave=dpm-performance, auto
 
 ---
 
-## 8. Installation
+## 8. Repository structure
+
+```
+tuned-tumbleweed-config/
+├── profiles/
+│   └── crisis-desktop/
+│       ├── tuned.conf      # Main profile — inherits balanced, overrides per section
+│       └── script.sh       # Post-plugin script — audio power_save=0, ALPM verify
+├── modprobe.d/
+│   └── 99-audio-nosuspend.conf  # Boot-time audio fix (power_save=0 at module load)
+└── LICENSE
+```
+
+---
+
+## 9. Installation
 
 ### Requirements
 
@@ -480,7 +567,17 @@ sudo systemctl enable --now tuned
 ```bash
 sudo mkdir -p /etc/tuned/profiles/crisis-desktop
 sudo cp profiles/crisis-desktop/tuned.conf /etc/tuned/profiles/crisis-desktop/tuned.conf
+sudo cp profiles/crisis-desktop/script.sh /etc/tuned/profiles/crisis-desktop/script.sh
+sudo chmod 755 /etc/tuned/profiles/crisis-desktop/script.sh
 ```
+
+### Disable audio auto-suspend at module level
+
+```bash
+sudo cp modprobe.d/99-audio-nosuspend.conf /etc/modprobe.d/
+```
+
+This ensures `power_save=0` is applied at kernel module load time, independently of tuned.
 
 ### Activate
 
@@ -497,7 +594,7 @@ tuned-adm verify
 
 ---
 
-## 9. Useful commands
+## 10. Useful commands
 
 ### tuned — profile management
 
