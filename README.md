@@ -499,6 +499,8 @@ tuned-adm verify
 
 ## 9. Useful commands
 
+### tuned — profile management
+
 ```bash
 # Show active profile
 tuned-adm active
@@ -506,28 +508,148 @@ tuned-adm active
 # List all available profiles
 tuned-adm list
 
-# Check that tuned settings were correctly applied
+# Verify all tuned settings were correctly applied to the running system
 tuned-adm verify
 
-# Show current CPU governor on all cores
+# Reload the active profile (re-apply all settings without reboot)
+sudo tuned-adm profile crisis-desktop
+```
+
+---
+
+### cpupower — the parallel view
+
+`cpupower` is a standalone tool that reads and writes CPU frequency settings directly, independently from tuned. Understanding the relationship between the two is essential.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  Who controls what                              │
+│                                                                 │
+│   tuned (daemon)           cpupower (CLI tool)                  │
+│   ───────────────          ───────────────────                  │
+│   • Manages governor       • Reads governor                     │
+│   • Sets EPP               • Can set governor manually          │
+│   • Sets boost             • Can set boost manually             │
+│   • Sets disk readahead    • Can set frequency range manually   │
+│   • Sets audio timeout     • Shows full P-state table           │
+│   • Sets video GPU mode    • Shows idle C-state stats           │
+│                                                                 │
+│   ⚠ If you set a governor manually with cpupower,              │
+│     tuned will override it on next reload or profile change.   │
+│     tuned always wins — it is a daemon, cpupower is one-shot.  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Full frequency info — verify the active governor and P-states
+
+```bash
+sudo cpupower frequency-info
+```
+
+Expected output on this system:
+
+```
+analyzing CPU 1:
+  driver: acpi-cpufreq
+  CPUs which run at the same hardware frequency: 1
+  maximum transition latency: 4.0 us
+  hardware limits: 1000 MHz - 2.00 GHz
+  available frequency steps:  2.00 GHz, 1.80 GHz, 1.60 GHz, 1.40 GHz, 1.20 GHz, 1000 MHz
+  available cpufreq governors: conservative ondemand performance schedutil
+  current policy: frequency should be within 1000 MHz and 2.00 GHz.
+                  The governor "schedutil" may decide which speed to use   ← governor confirmed
+  current CPU frequency: 2.00 GHz (asserted by call to hardware)
+  boost state support:
+    Supported: yes
+    Active: no       ← see explanation below
+    Boost States: 2
+    Total States: 8
+    Pstate-Pb0: 2400MHz (boost state)   ← AMD boost P-state 1
+    Pstate-Pb1: 2200MHz (boost state)   ← AMD boost P-state 2
+    Pstate-P0:  2000MHz                 ← normal max (rated TDP)
+    Pstate-P1:  1800MHz
+    Pstate-P2:  1600MHz
+    Pstate-P3:  1400MHz
+    Pstate-P4:  1200MHz
+    Pstate-P5:  1000MHz                 ← minimum
+```
+
+> **"Active: no" does NOT mean boost is disabled.**  
+> It means no CPU core is *currently running* in a boost P-state at the moment the command was executed.  
+> Boost is **enabled** (`/sys/devices/system/cpu/cpufreq/boost = 1`) — it activates automatically  
+> when the scheduler requests it and thermal headroom allows. Under sustained load you will see  
+> cores reaching 2200–2400 MHz transiently.
+
+```
+Boost state diagram:
+
+  Boost enabled (boost=1), no current load:
+  ┌────────────────────────────────────────┐
+  │  Active: no                            │
+  │  Current freq: 1600–2000 MHz           │  ← schedutil picks proportionally
+  │  Boost P-states: available but idle    │
+  └────────────────────────────────────────┘
+
+  Boost enabled, CPU under burst load:
+  ┌────────────────────────────────────────┐
+  │  Active: yes                           │
+  │  Current freq: 2200–2400 MHz           │  ← boost P-states engaged
+  │  Duration: transient (thermal limit)   │
+  └────────────────────────────────────────┘
+```
+
+#### Monitor all cores — frequency, C-states, idle time
+
+```bash
+sudo cpupower monitor
+```
+
+Expected output:
+
+```
+    | Mperf              || Idle_Stats
+ CPU| C0   | Cx   | Freq  || POLL | C1   | C2
+   0| 56.13| 43.87|  1803 ||  0.00| 12.30| 32.34
+   1| 26.32| 73.68|  1875 ||  0.00| 16.13| 58.30
+   2| 35.14| 64.86|  1818 ||  0.00| 18.29| 47.53
+   3| 17.86| 82.14|  1813 ||  0.00| 20.90| 62.06
+```
+
+Reading the columns:
+
+| Column | Meaning |
+|--------|---------|
+| `C0` | % of time the core was active (executing instructions) |
+| `Cx` | % of time the core was in any idle state |
+| `Freq` | Average frequency during the measurement window (MHz) |
+| `C1` | % of time in shallow idle (fast wake, ~1 μs) |
+| `C2` | % of time in deeper idle (slower wake, ~10 μs) |
+
+A healthy desktop at rest: low C0 (< 30%), high C2, Freq around 1400–1800 MHz — schedutil correctly scaling down on idle cores.
+
+---
+
+### sysfs — low-level verification
+
+```bash
+# Confirm governor is schedutil on all 4 cores
 cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 
-# Show current CPU frequency on all cores (in kHz)
-cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq
-
-# Monitor CPU frequency live
-watch -n 1 "cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq | awk '{print \$1/1000 \" MHz\"}'"
-
-# Confirm AMD boost is enabled
+# Confirm AMD boost is enabled (1 = on, 0 = off)
 cat /sys/devices/system/cpu/cpufreq/boost
 
-# Check current swappiness
+# Current frequency per core (in kHz — divide by 1000 for MHz)
+cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq
+
+# Monitor frequency live across all cores
+watch -n 1 "paste <(ls /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq) \
+  <(cat /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq) | \
+  awk '{printf \"CPU %s: %d MHz\n\", NR-1, \$2/1000}'"
+
+# Confirm swappiness
 sysctl vm.swappiness
 
-# Check EPP value
-cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference
-
-# Show readahead for main block device
+# Show readahead for main block device (result in 512-byte sectors)
 blockdev --getra /dev/sda
 ```
 
