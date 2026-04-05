@@ -1,6 +1,38 @@
-# RELEASE
+# RELEASE — tuned-tumbleweed-config
 
-Version: v1.0
-Date:    2026-04-05
+Version:  v1.0
+Date:     2026-04-04
+Platform: openSUSE Tumbleweed
+Hardware: HP Pavilion 17 / AMD A8-6410 / SSD USB
+tuned:    2.x
 
-See CHANGELOG.md for details.
+---
+
+## What's in this release
+
+### Profile: crisis-desktop
+Custom tuned profile optimized for a low-power desktop running a full monitoring
+and proxy stack (Squid, Unbound, Caddy, Prometheus, Grafana, Loki, KVM).
+
+### CPU
+- Governor: `ondemand` — balances responsiveness and power savings
+- `up_threshold=70`, `sampling_down_factor=100` — reduces unnecessary frequency jumps
+- CPU boost: disabled (`boost=0`) — prevents thermal throttling on AMD A8-6410
+
+### Disk
+- Scheduler: `bfq` on SSD USB — optimized for mixed read/write and low-latency I/O
+- `scsi_host` link_power_management: `med_power_with_dipm` — power saving without latency penalty
+
+### Memory
+- `vm.swappiness=10` — prefer RAM, minimize swap usage
+- `vm.dirty_ratio=15`, `vm.dirty_background_ratio=5` — controlled writeback on USB SSD
+
+### Network
+- `net.core.rmem_max` / `wmem_max` tuned for streaming and proxy workloads
+- Optimized for concurrent Squid + KVM network traffic
+
+### Audio
+- Timer slack workaround for upstream tuned audio plugin bug (_norm_value)
+
+### Verified
+- All `tuned-adm verify` failures documented, resolved or justified inline
