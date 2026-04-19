@@ -1,0 +1,7 @@
+*.bak.*
+
+# Scripts de travail temporaires
+*.sh
+
+# Fichiers backup
+*.bak.*
